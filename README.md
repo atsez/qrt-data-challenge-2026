@@ -1,6 +1,6 @@
 # QRT Data Challenge 2026: Asset Allocation Performance Forecasting
 
-Predicting whether a systematic portfolio ("allocation") goes up or down the next day from its last 20 days of returns and volume. Individual entry. Final public leaderboard accuracy **0.5197** against the official benchmark of **0.5079**.
+Predicting whether a systematic portfolio ("allocation") goes up or down the next day from its last 20 days of returns and volume. Individual entry. Final public leaderboard accuracy **0.531** against the official benchmark of **0.5079**.
 
 ## The finding
 
