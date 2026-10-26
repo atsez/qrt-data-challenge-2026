@@ -1,0 +1,148 @@
+"""End-to-end pipeline: features -> timeline -> purged cross-validation -> report -> submission.
+
+    python pipeline.py                 # full run on data/ (about 10-15 minutes on a laptop)
+    python pipeline.py --fast          # smaller models, quick smoke run
+"""
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import GroupKFold
+
+from src.data import load
+from src.features import BASE_FEATURES, build_features
+from src.models import FinalModel, logistic, single_lgbm
+from src.timeline import link_rates, next_day_sign_agreement, reconstruct_order
+from src.validation import purged_folds
+
+SEED = 42
+
+
+def cv_score(make_model, X, y, folds, train_acc=False):
+    val, trn = [], []
+    for tr, va in folds:
+        m = make_model().fit(X.iloc[tr], y.iloc[tr])
+        val.append(float((m.predict(X.iloc[va]) == y.values[va]).mean()))
+        if train_acc:
+            sub = tr[np.random.default_rng(SEED).choice(len(tr), min(len(tr), 100_000), replace=False)]
+            trn.append(float((m.predict(X.iloc[sub]) == y.values[sub]).mean()))
+    return val, trn
+
+
+def run(data_dir="data", out_dir="results", sub_dir="submissions", scale=1.0, n_jobs=None, log=print):
+    t0 = time.time()
+    np.random.seed(SEED)
+    x_tr, y, ret_next, x_te = load(data_dir)
+    F_tr = build_features(x_tr)
+    F_te = build_features(x_te)[F_tr.columns]
+    ts = x_tr["TS"].to_numpy()
+    log(f"loaded {len(x_tr)} train rows, {len(x_te)} test rows, {F_tr.shape[1]} features")
+
+    # ---- timeline and leakage diagnostics ----
+    order, n_seg = reconstruct_order(x_tr)
+    links = link_rates(x_tr, x_te)
+    agree = next_day_sign_agreement(x_tr, y.values)
+    day_major = y.groupby(ts).transform("mean")
+    oracle = float(((day_major > 0.5).astype(int) == y).mean())
+    log(f"timeline rebuilt into {n_seg} segments ({time.time() - t0:.0f}s)")
+
+    n_dates = len(order)
+    block, purge = min(40, max(2, n_dates // 20)), min(20, max(1, n_dates // 20))
+    folds = list(purged_folds(ts, order, block=block, purge=purge))
+    rows = []
+
+    def add(name, feats, make, train_acc=False):
+        val, trn = cv_score(make, F_tr[feats], y, folds, train_acc)
+        rows.append(dict(model=name, n_features=len(feats), mean=np.mean(val), std=np.std(val),
+                         folds=val, train=np.mean(trn) if trn else None))
+        log(f"  {name:<44} {np.mean(val):.4f} ({time.time() - t0:.0f}s)")
+
+    all_feats = list(F_tr.columns)
+    rows.append(dict(model="Always predict up", n_features=0, mean=float(y.mean()), std=0.0,
+                     folds=[], train=None))
+    add("Logistic regression, 8 base features", BASE_FEATURES, logistic)
+    add("Logistic regression, all features", all_feats, logistic)
+    add("LightGBM (single), 8 base features", BASE_FEATURES, lambda: single_lgbm(scale))
+    add("LightGBM (single), all features", all_feats, lambda: single_lgbm(scale), train_acc=True)
+    add("Final: LightGBM 2 configs x 3 seeds, all features", all_feats,
+        lambda: FinalModel(scale, n_jobs), train_acc=True)
+
+    # same single model, but with a naive random-date split (leaky) for comparison
+    naive = list(GroupKFold(n_splits=5).split(F_tr, y, ts))
+    naive_val, _ = cv_score(lambda: single_lgbm(scale), F_tr, y, naive)
+
+    # ---- feature importance on fold 0 ----
+    tr, va = folds[0]
+    m = single_lgbm(scale).fit(F_tr.iloc[tr], y.iloc[tr])
+    gain = pd.Series(m.booster_.feature_importance("gain"), index=all_feats)
+    gain = gain / gain.sum()
+    va_s = va[np.random.default_rng(SEED).choice(len(va), min(len(va), 50_000), replace=False)]
+    perm = permutation_importance(m, F_tr.iloc[va_s], y.iloc[va_s], scoring="neg_log_loss",
+                                  n_repeats=3, random_state=SEED, n_jobs=1)
+    imp = pd.DataFrame({"gain_share": gain,
+                        "perm_logloss_increase": perm.importances_mean,
+                        "perm_std": perm.importances_std}).sort_values("gain_share", ascending=False)
+
+    # ---- final fit and submission ----
+    final = FinalModel(scale, n_jobs).fit(F_tr, y)
+    pred = final.predict(F_te)
+    Path(sub_dir).mkdir(parents=True, exist_ok=True)
+    sub = pd.DataFrame({"ROW_ID": x_te["ROW_ID"], "TARGET": pred})
+    sub.to_csv(Path(sub_dir) / "submission.csv", index=False)
+
+    report = write_report(Path(out_dir), x_tr, x_te, n_seg, links, agree, oracle, rows,
+                          np.mean(naive_val), imp, pred, scale, time.time() - t0, block, purge)
+    log(f"done in {time.time() - t0:.0f}s")
+    return dict(rows=rows, importance=imp, submission=sub, report=report)
+
+
+def write_report(out, x_tr, x_te, n_seg, links, agree, oracle, rows, naive, imp, pred, scale, secs,
+                 block, purge):
+    out.mkdir(parents=True, exist_ok=True)
+    L = ["# Results", "",
+         "Generated by `python pipeline.py`. Every number below comes from this run.", ""]
+    if scale != 1.0:
+        L += [f"**Smoke run (model size x{scale}); not the reported results.**", ""]
+    L += ["## Data", "",
+          f"- Train: {len(x_tr):,} rows, {x_tr.TS.nunique():,} dates, {x_tr.ALLOCATION.nunique()} allocations",
+          f"- Test: {len(x_te):,} rows, {x_te.TS.nunique():,} dates", "",
+          "## Timeline and leakage checks", "",
+          f"- Training dates rebuilt into {n_seg} contiguous segments.",
+          f"- Train dates with a next-day neighbour in the data: {links['later'][0]:.3f}; "
+          f"test dates: {links['later'][1]:.3f}.",
+          f"- Train dates with a previous-day neighbour: {links['earlier'][0]:.3f}; "
+          f"test dates: {links['earlier'][1]:.3f}.",
+          f"- On train, sign(next day's RET_1) matches the target {agree:.3f} of the time.",
+          f"- Ceiling if each date's majority sign were known: {oracle:.4f}.", "",
+          f"## Purged, blocked cross-validation (5 folds, {block}-date blocks, {purge}-date purge)", "",
+          "| Model | Features | Accuracy | Std across folds | Train accuracy |",
+          "|---|---|---|---|---|"]
+    for r in rows:
+        tr = f"{r['train']:.4f}" if r["train"] is not None else "-"
+        L.append(f"| {r['model']} | {r['n_features']} | {r['mean']:.4f} | {r['std']:.4f} | {tr} |")
+    single = next(r for r in rows if r["model"] == "LightGBM (single), all features")
+    L += ["", f"Same single LightGBM with a naive random-date split (leaky): {naive:.4f} "
+          f"vs {single['mean']:.4f} purged.", "",
+          "## Feature importance (single LightGBM, fold 0)", "",
+          "Gain share from the trees; permutation importance is the increase in validation "
+          "log loss when the feature is shuffled (50k validation rows, 3 repeats).", "",
+          "| Feature | Gain share | Permutation (log loss increase) |", "|---|---|---|"]
+    for f, r in imp.iterrows():
+        L.append(f"| {f} | {r.gain_share:.3f} | {r.perm_logloss_increase:.5f} +/- {r.perm_std:.5f} |")
+    L += ["", "## Submission", "", f"- Rows: {len(pred):,}; share predicted up: {pred.mean():.3f}",
+          f"- Runtime: {secs / 60:.1f} minutes", ""]
+    text = "\n".join(L)
+    (out / "results.md").write_text(text)
+    return text
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="data")
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--fast", action="store_true", help="10x smaller models for a quick check")
+    a = ap.parse_args()
+    run(a.data, a.out, scale=0.1 if a.fast else 1.0)
